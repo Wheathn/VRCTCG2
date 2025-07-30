@@ -1,0 +1,38 @@
+# Node.js dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+yarn.lock
+package-lock.json
+
+# Environment variables
+.env
+
+# Player data
+PlayerData/
+PlayerData/**
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Build artifacts
+dist/
+build/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Other common ignores
+*.pid
+*.seed
+*.pid.lock
+coverage/
