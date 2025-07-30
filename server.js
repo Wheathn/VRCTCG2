@@ -8,7 +8,8 @@ const { generateBoosterPack } = require('./packLogic');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CARD_DATA_DIR = path.join(__dirname, 'CardData');
-const PLAYER_DATA_DIR = path.join(__dirname, 'PlayerData');
+const PLAYER_DATA_DIR = process.env.PLAYER_DATA_PATH || path.join(__dirname, 'PlayerData');
+const IP_MAPPING_FILE = path.join(PLAYER_DATA_DIR, 'ip_mappings.json');
 const XOR_KEY = 0x5A;
 const SHIFT_VALUE = 42;
 
@@ -36,7 +37,6 @@ const SET_IDS = {
     'SWSH35': 21,
     'SWSH4': 23,
     'SWSH45': 23
-    // Add more set mappings as needed
 };
 
 app.use(express.json());
@@ -51,6 +51,34 @@ async function ensurePlayerDataDir() {
     }
 }
 
+// Load/save IP-to-username mappings
+async function loadIpMappings() {
+    try {
+        const data = await fs.readFile(IP_MAPPING_FILE, 'utf8');
+        const mappings = JSON.parse(data);
+        for (const [ip, username] of Object.entries(mappings)) {
+            ipToUsername.set(ip, username);
+        }
+        console.log(`Loaded ${ipToUsername.size} IP mappings from ${IP_MAPPING_FILE}`);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            console.log(`No IP mappings file found at ${IP_MAPPING_FILE}, starting fresh`);
+        } else {
+            console.error('Error loading IP mappings:', error.message);
+        }
+    }
+}
+
+async function saveIpMappings() {
+    try {
+        const mappings = Object.fromEntries(ipToUsername);
+        await fs.writeFile(IP_MAPPING_FILE, JSON.stringify(mappings, null, 2));
+        console.log(`Saved ${ipToUsername.size} IP mappings to ${IP_MAPPING_FILE}`);
+    } catch (error) {
+        console.error('Error saving IP mappings:', error.message);
+    }
+}
+
 // Pack definitions with costs
 const PACKS = {
     'SVP': { name: 'Scarlet & Violet Promo', cost: 100 },
@@ -60,7 +88,6 @@ const PACKS = {
     'SWSH1': { name: 'Sword & Shield Base Set', cost: 100 },
     'SWSH35': { name: 'Champion\'s Path', cost: 120 },
     'SWSH45': { name: 'Shining Fates', cost: 120 }
-    // Add more packs as needed
 };
 
 // Load card data from txt files
@@ -114,7 +141,7 @@ async function loadCardData() {
     }
 }
 
-// Deobfuscation functions from the original server
+// Deobfuscation functions
 function hexDecode(hexString) {
     if (!hexString || hexString.length % 2 !== 0) return '';
     let result = '';
@@ -152,7 +179,7 @@ async function getPlayerData(username) {
                 cards: {}
             };
             await fs.writeFile(filePath, JSON.stringify(newPlayer, null, 2));
-            console.log(`Created new player data for ${username} with 25000 currency`);
+            console.log(`Created new player data for ${username} with 25000 currency at ${filePath}`);
             return newPlayer;
         }
         console.error(`Error reading player data for ${username}:`, error.message);
@@ -164,7 +191,7 @@ async function savePlayerData(username, data) {
     const filePath = path.join(PLAYER_DATA_DIR, `${username}.json`);
     try {
         await fs.writeFile(filePath, JSON.stringify(data, null, 2));
-        console.log(`Saved player data for ${username}`);
+        console.log(`Saved player data for ${username} at ${filePath}`);
     } catch (error) {
         console.error(`Error saving player data for ${username}:`, error.message);
         throw error;
@@ -174,7 +201,15 @@ async function savePlayerData(username, data) {
 // IP to username mapping
 const ipToUsername = new Map();
 
-// Login endpoint (VRChat-compatible)
+// Middleware to get client IP
+function getClientIp(req) {
+    const forwarded = req.headers['x-forwarded-for'];
+    const ip = forwarded ? forwarded.split(',')[0].trim() : req.ip;
+    console.log(`[getClientIp] Raw x-forwarded-for: ${forwarded}, req.ip: ${req.ip}, Selected IP: ${ip}`);
+    return ip;
+}
+
+// Login endpoint
 app.get('/login', async (req, res) => {
     console.log('Handling /login');
     const obfuscatedUsername = req.query.n || '';
@@ -197,13 +232,15 @@ app.get('/login', async (req, res) => {
 
     try {
         const playerData = await getPlayerData(username);
+        const clientIp = getClientIp(req);
         if (!playerData.password) {
             const hashedPassword = await bcrypt.hash(password, 10);
             playerData.password = hashedPassword;
-            playerData.ip = req.ip;
+            playerData.ip = clientIp;
             await savePlayerData(username, playerData);
-            ipToUsername.set(req.ip, username);
-            console.log(`[login] Registered new user: ${username} with 25000 currency`);
+            ipToUsername.set(clientIp, username);
+            await saveIpMappings();
+            console.log(`[login] Registered new user: ${username} with IP ${clientIp}`);
             return res.json({ message: 'Account created and logged in', username });
         }
 
@@ -213,10 +250,11 @@ app.get('/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid password' });
         }
 
-        playerData.ip = req.ip;
+        playerData.ip = clientIp;
         await savePlayerData(username, playerData);
-        ipToUsername.set(req.ip, username);
-        console.log(`[login] Logged in user: ${username}`);
+        ipToUsername.set(clientIp, username);
+        await saveIpMappings();
+        console.log(`[login] Logged in user: ${username} with IP ${clientIp}`);
         res.json({ message: 'Logged in successfully', username });
     } catch (error) {
         console.error('[login] Error in /login:', error.message);
@@ -226,19 +264,21 @@ app.get('/login', async (req, res) => {
 
 // Middleware to get username from IP or JSON files
 async function getUsernameFromIP(req, res, next) {
-    let username = ipToUsername.get(req.ip);
+    const clientIp = getClientIp(req);
+    let username = ipToUsername.get(clientIp);
     if (!username) {
         try {
             const files = await fs.readdir(PLAYER_DATA_DIR);
-            const jsonFiles = files.filter(file => file.endsWith('.json'));
+            const jsonFiles = files.filter(file => file.endsWith('.json') && file !== 'ip_mappings.json');
             for (const file of jsonFiles) {
                 const filePath = path.join(PLAYER_DATA_DIR, file);
                 const data = await fs.readFile(filePath, 'utf8');
                 const playerData = JSON.parse(data);
-                if (playerData.ip === req.ip && playerData.password) {
+                if (playerData.ip === clientIp && playerData.password) {
                     username = file.replace('.json', '');
-                    ipToUsername.set(req.ip, username);
-                    console.log(`[getUsernameFromIP] Matched IP ${req.ip} to user ${username} from JSON`);
+                    ipToUsername.set(clientIp, username);
+                    await saveIpMappings();
+                    console.log(`[getUsernameFromIP] Matched IP ${clientIp} to user ${username} from JSON`);
                     break;
                 }
             }
@@ -248,6 +288,7 @@ async function getUsernameFromIP(req, res, next) {
     }
 
     if (!username) {
+        console.log(`[getUsernameFromIP] No username found for IP ${clientIp}`);
         return res.status(401).json({ error: 'Not authenticated. Please login first via /login.' });
     }
 
@@ -325,6 +366,7 @@ app.get('/inventory', getUsernameFromIP, async (req, res) => {
 async function startServer() {
     await ensurePlayerDataDir();
     await loadCardData();
+    await loadIpMappings();
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
     });
